@@ -1,0 +1,273 @@
+let
+  // =========================================================================
+  // PARAMETERS
+  // =========================================================================
+  OpenStageEndBehavior = "Null",   // "Now" | "Null"
+
+  // =========================================================================
+  // SOURCES (reference EXISTING queries)
+  // =========================================================================
+  SourceHistory = #"Opportunity Field History",
+  SourceOpp     = #"Opportunity",
+  SourceAcct    = #"Account",
+  SourceUser    = #"User",
+
+  // =========================================================================
+  // KEEP NEEDED COLUMNS & FILTER EVENTS
+  // - StageName = all stage transitions
+  // - Created   = Salesforce card creation (we'll map to "Request Confirmed")
+  // =========================================================================
+  HistKeep =
+      Table.SelectColumns(
+        SourceHistory,
+        // If some columns don't exist in your model, remove them here:
+        {"OpportunityId","Field","OldValue","NewValue","CreatedDate","CreatedById"}
+      ),
+  HistFiltered =
+      Table.SelectRows(
+        HistKeep,
+        each Text.Lower([Field]) = "stagename" or Text.Lower([Field]) = "created"
+      ),
+
+  // Types
+  HistTyped =
+      Table.TransformColumnTypes(
+        HistFiltered,
+        {
+          {"OpportunityId", type text},
+          {"Field",         type text},
+          {"OldValue",      type text},
+          {"NewValue",      type text},
+          {"CreatedDate",   type datetime},
+          {"CreatedById",   type text}
+        }
+      ),
+
+  // =========================================================================
+  // NORMALIZE "CREATED" EVENT → pseudo-stage row (ToStage = Request Confirmed)
+  // =========================================================================
+  AddToStageForCreated =
+      Table.AddColumn(
+        HistTyped, "ToStageRaw",
+        each if Text.Lower([Field]) = "created" then "Request Confirmed" else [NewValue],
+        type text
+      ),
+  AddFromStageForCreated =
+      Table.AddColumn(
+        AddToStageForCreated, "FromStageRaw",
+        each if Text.Lower([Field]) = "created" then null else [OldValue],
+        type text
+      ),
+
+  // Keep only events that actually produce a ToStage
+  HistMeaningful =
+      Table.SelectRows(AddFromStageForCreated, each [ToStageRaw] <> null and Text.Trim([ToStageRaw]) <> ""),
+
+  // Sort for stable sequencing
+  HistSorted =
+      Table.Sort(HistMeaningful, {{"OpportunityId", Order.Ascending}, {"CreatedDate", Order.Ascending}}),
+
+  // =========================================================================
+  // BUILD DURATIONS BY OPPORTUNITY (LEAD CreatedDate as StageEnd)
+  // =========================================================================
+  Grouped =
+      Table.Group(
+        HistSorted, {"OpportunityId"},
+        {
+          {
+            "Rows",
+            (t) =>
+              let
+                t1 = Table.AddIndexColumn(t, "ix", 0, 1, Int64.Type),
+
+                nextDateList  = List.Skip(t1[CreatedDate], 1) & {null},
+                nextStageList = List.Skip(t1[ToStageRaw],   1) & {null},
+
+                t2 = Table.AddColumn(t1, "StageEndRaw", each nextDateList{[ix]}, type nullable datetime),
+                t3 = Table.AddColumn(t2, "NextStageRaw", each nextStageList{[ix]}, type nullable text),
+
+                // Choose open-stage handling
+                t4 =
+                  if OpenStageEndBehavior = "Now" then
+                    Table.TransformColumns(
+                      t3,
+                      {{"StageEndRaw", (d) => if d = null then DateTime.LocalNow() else d, type datetime}}
+                    )
+                  else t3,   // "Null" => leave StageEndRaw as null
+
+                t5 = Table.AddColumn(
+                       t4, "DurationDaysRaw",
+                       each if [StageEndRaw] = null then null else Duration.Days([StageEndRaw] - [CreatedDate]),
+                       Int64.Type
+                     ),
+
+                // Keep rows with non-negative duration OR still-open (null end) if you prefer to keep them
+                t6 =
+                  if OpenStageEndBehavior = "Null" then
+                    t5
+                  else
+                    Table.SelectRows(t5, each [StageEndRaw] <> null and [DurationDaysRaw] >= 0)
+              in
+                t6,
+            type table
+          }
+        }
+      ),
+
+  Expanded =
+      Table.ExpandTableColumn(
+        Grouped, "Rows",
+        {"FromStageRaw","ToStageRaw","CreatedDate","StageEndRaw","NextStageRaw","DurationDaysRaw","CreatedById"},
+        {"FromStage","ToStage","StageStart","StageEnd","NextStage","DurationDays","Hist_CreatedById"}
+      ),
+
+  // =========================================================================
+  // CANONICAL STAGE MAPPING (clean labels for KPIs)
+  // =========================================================================
+  CanonMap = #table(
+    {"raw","canon"},
+    {
+      {"new","New"},
+      {"intake","Intake"},
+      {"intake form","Intake"},
+      {"request submitted","Intake"},
+      {"request confirmed","Request Confirmed"},
+      {"created","Request Confirmed"},     // safety
+      {"engagement","Engagement"},
+      {"staging engagement","Engagement"},
+      {"ready to assign","Ready to Assign"},
+      {"development","Development"},
+      {"dev","Development"},
+      {"testing","Testing"},
+      {"pending deployment","Pending Deployment"},
+      {"post go live","Post Go Live"},
+      {"post‑go‑live","Post Go Live"},
+      {"complete","Complete"},
+      {"closed","Closed"},
+      {"blocked","Blocked"},
+      {"removed","Removed"}
+    }
+  ),
+
+  ToCanon = (s as nullable text) as nullable text =>
+    let
+      lower = if s=null then null else Text.Lower(Text.Trim(s)),
+      match = try Table.SelectRows(CanonMap, each [raw] = lower){0}[canon] otherwise s
+    in match,
+
+  CanonApplied =
+      Table.TransformColumns(
+        Expanded,
+        {
+          {"FromStage", ToCanon, type text},
+          {"ToStage",   ToCanon, type text},
+          {"NextStage", ToCanon, type text}
+        }
+      ),
+
+  // =========================================================================
+  // BRING IN OPPORTUNITY / ACCOUNT / USER ATTRIBUTES (DENORMALIZED)
+  // No relationships needed — merge directly and keep the columns you want
+  // =========================================================================
+
+  // ---- Opportunity ----
+  OppKeep =
+      let
+        cols = List.Intersect({
+          {"Id","Name","AccountId","OwnerId","StageName","CloseDate"},
+          Table.ColumnNames(SourceOpp)
+        })
+      in
+        Table.TransformColumnTypes(Table.SelectColumns(SourceOpp, cols), {{"Id", type text},{"AccountId", type text},{"OwnerId", type text}}),
+
+  MergeOpp = Table.NestedJoin(CanonApplied, {"OpportunityId"}, OppKeep, {"Id"}, "Opp", JoinKind.LeftOuter),
+  ExpandOpp =
+      Table.ExpandTableColumn(
+        MergeOpp, "Opp",
+        List.RemoveNulls({"Name","AccountId","OwnerId","StageName","CloseDate"}),
+        List.Transform(List.RemoveNulls({"Name","AccountId","OwnerId","StageName","CloseDate"}), each "Opp_" & _)
+      ),
+
+  // ---- Account (join via Opp_AccountId) ----
+  AcctKeep =
+      let
+        cols = List.Intersect({
+          {"Id","Name"},
+          Table.ColumnNames(SourceAcct)
+        })
+      in
+        Table.TransformColumnTypes(Table.SelectColumns(SourceAcct, cols), {{"Id", type text}}),
+
+  MergeAcct = Table.NestedJoin(ExpandOpp, {"Opp_AccountId"}, AcctKeep, {"Id"}, "Acct", JoinKind.LeftOuter),
+  ExpandAcct =
+      Table.ExpandTableColumn(
+        MergeAcct, "Acct",
+        List.RemoveNulls({"Name"}),
+        List.Transform(List.RemoveNulls({"Name"}), each "Account_" & _)
+      ),
+
+  // ---- User (Owner) (join via Opp_OwnerId) ----
+  UserKeep =
+      let
+        cols = List.Intersect({
+          {"Id","Name"},
+          Table.ColumnNames(SourceUser)
+        })
+      in
+        Table.TransformColumnTypes(Table.SelectColumns(SourceUser, cols), {{"Id", type text}}),
+
+  MergeOwner = Table.NestedJoin(ExpandAcct, {"Opp_OwnerId"}, UserKeep, {"Id"}, "Owner", JoinKind.LeftOuter),
+  ExpandOwner =
+      Table.ExpandTableColumn(
+        MergeOwner, "Owner",
+        List.RemoveNulls({"Name"}),
+        List.Transform(List.RemoveNulls({"Name"}), each "Owner_" & _)
+      ),
+
+  // ---- User (History CreatedBy) (join via Hist_CreatedById) ----
+  MergeHistUser = Table.NestedJoin(ExpandOwner, {"Hist_CreatedById"}, UserKeep, {"Id"}, "HistUser", JoinKind.LeftOuter),
+  ExpandHistUser =
+      Table.ExpandTableColumn(
+        MergeHistUser, "HistUser",
+        List.RemoveNulls({"Name"}),
+        List.Transform(List.RemoveNulls({"Name"}), each "HistUser_" & _)
+      ),
+
+  // =========================================================================
+  // FINAL SHAPE & TYPES (denormalized fact — no relationships required)
+  // =========================================================================
+  SelectCols =
+      let
+        desired = {
+          "OpportunityId",
+          "FromStage","ToStage","NextStage",
+          "StageStart","StageEnd","DurationDays",
+          // Opportunity snapshot
+          "Opp_Name","Opp_StageName","Opp_CloseDate",
+          // Account
+          "Account_Name",
+          // Owner
+          "Owner_Name",
+          // Who performed the history change
+          "HistUser_Name"
+        },
+        existing = List.Intersect({desired, Table.ColumnNames(ExpandHistUser)})
+      in
+        Table.SelectColumns(ExpandHistUser, existing),
+
+  TypedFinal =
+      Table.TransformColumnTypes(
+        SelectCols,
+        {
+          {"OpportunityId", type text},
+          {"FromStage", type text}, {"ToStage", type text}, {"NextStage", type text},
+          {"StageStart", type datetime}, {"StageEnd", type nullable datetime},
+          {"DurationDays", Int64.Type},
+          {"Opp_Name", type text}, {"Opp_StageName", type text}, {"Opp_CloseDate", type nullable date},
+          {"Account_Name", type text},
+          {"Owner_Name", type text},
+          {"HistUser_Name", type text}
+        }
+      )
+in
+  TypedFinal
