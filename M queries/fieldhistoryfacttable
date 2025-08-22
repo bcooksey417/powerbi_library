@@ -3,6 +3,8 @@ let
   // PARAMETERS
   // =========================================================================
   OpenStageEndBehavior = "Null",   // "Now" | "Null"
+  WorkingDayStart      = #time(9,0,0),   // Business day start (9:00)
+  WorkingDayEnd        = #time(17,0,0),  // Business day end   (17:00)
 
   // =========================================================================
   // SOURCES (reference EXISTING queries)
@@ -20,7 +22,6 @@ let
   HistKeep =
       Table.SelectColumns(
         SourceHistory,
-        // If some columns don't exist in your model, remove them here:
         {"OpportunityId","Field","OldValue","NewValue","CreatedDate","CreatedById"}
       ),
   HistFiltered =
@@ -93,22 +94,63 @@ let
                       t3,
                       {{"StageEndRaw", (d) => if d = null then DateTime.LocalNow() else d, type datetime}}
                     )
-                  else t3,   // "Null" => leave StageEndRaw as null
+                  else t3,
 
+                // Duration in calendar days
                 t5 = Table.AddColumn(
                        t4, "DurationDaysRaw",
                        each if [StageEndRaw] = null then null else Duration.Days([StageEndRaw] - [CreatedDate]),
                        Int64.Type
                      ),
 
-                // Keep rows with non-negative duration OR still-open (null end) if you prefer to keep them
-                t6 =
-                  if OpenStageEndBehavior = "Null" then
-                    t5
-                  else
-                    Table.SelectRows(t5, each [StageEndRaw] <> null and [DurationDaysRaw] >= 0)
+                // =========================================================================
+                // BUSINESS DAYS: Mon–Fri only (exclusive of end date)
+                // =========================================================================
+                t6 = Table.AddColumn(
+                       t5, "BusinessDaysRaw",
+                       each if [StageEndRaw] = null then null else
+                         let
+                           s = Date.From([CreatedDate]),
+                           e = Date.AddDays(Date.From([StageEndRaw]), -1),    // exclusive of StageEnd
+                           span = if e < s then 0 else Duration.Days(e - s) + 1,
+                           dates = if span <= 0 then {} else List.Dates(s, span, #duration(1,0,0,0)),
+                           weekdays = List.Select(dates, each Date.DayOfWeek(_, Day.Monday) < 5),
+                           cnt = List.Count(weekdays)
+                         in cnt,
+                       Int64.Type
+                     ),
+
+                // =========================================================================
+                // BUSINESS HOURS: within WorkingDayStart..WorkingDayEnd, Mon–Fri
+                // =========================================================================
+                t7 = Table.AddColumn(
+                       t6, "BusinessHoursRaw",
+                       each if [StageEndRaw] = null then null else
+                         let
+                           sDate = Date.From([CreatedDate]),
+                           eDate = Date.AddDays(Date.From([StageEndRaw]), -1),
+                           nDays = Duration.Days(eDate - sDate) + 1,
+                           allDays = if nDays <= 0 then {} else List.Dates(sDate, nDays, #duration(1,0,0,0)),
+                           weekdays = List.Select(allDays, each Date.DayOfWeek(_, Day.Monday) < 5),
+                           hoursPerDay = List.Transform(
+                             weekdays,
+                             (d as date) =>
+                               let
+                                 ws = #datetime(Date.Year(d), Date.Month(d), Date.Day(d),
+                                                Time.Hour(WorkingDayStart), Time.Minute(WorkingDayStart), 0),
+                                 we = #datetime(Date.Year(d), Date.Month(d), Date.Day(d),
+                                                Time.Hour(WorkingDayEnd), Time.Minute(WorkingDayEnd), 0),
+                                 ps = if Date.From([CreatedDate]) = d then if [CreatedDate] > ws then [CreatedDate] else ws else ws,
+                                 pe = if Date.From([StageEndRaw]) = d then if [StageEndRaw] < we then [StageEndRaw] else we else we,
+                                 hrs = Number.Max(0, Duration.TotalHours(pe - ps))
+                               in hrs
+                           ),
+                           total = List.Sum(hoursPerDay)
+                         in total,
+                       type number
+                     )
               in
-                t6,
+                t7,
             type table
           }
         }
@@ -117,8 +159,10 @@ let
   Expanded =
       Table.ExpandTableColumn(
         Grouped, "Rows",
-        {"FromStageRaw","ToStageRaw","CreatedDate","StageEndRaw","NextStageRaw","DurationDaysRaw","CreatedById"},
-        {"FromStage","ToStage","StageStart","StageEnd","NextStage","DurationDays","Hist_CreatedById"}
+        {"FromStageRaw","ToStageRaw","CreatedDate","StageEndRaw","NextStageRaw",
+         "DurationDaysRaw","BusinessDaysRaw","BusinessHoursRaw","CreatedById"},
+        {"FromStage","ToStage","StageStart","StageEnd","NextStage",
+         "DurationDays","BusinessDays","BusinessHours","Hist_CreatedById"}
       ),
 
   // =========================================================================
@@ -132,7 +176,7 @@ let
       {"intake form","Intake"},
       {"request submitted","Intake"},
       {"request confirmed","Request Confirmed"},
-      {"created","Request Confirmed"},     // safety
+      {"created","Request Confirmed"},
       {"engagement","Engagement"},
       {"staging engagement","Engagement"},
       {"ready to assign","Ready to Assign"},
@@ -148,13 +192,10 @@ let
       {"removed","Removed"}
     }
   ),
-
   ToCanon = (s as nullable text) as nullable text =>
-    let
-      lower = if s=null then null else Text.Lower(Text.Trim(s)),
-      match = try Table.SelectRows(CanonMap, each [raw] = lower){0}[canon] otherwise s
+    let lower = if s=null then null else Text.Lower(Text.Trim(s)),
+        match = try Table.SelectRows(CanonMap, each [raw] = lower){0}[canon] otherwise s
     in match,
-
   CanonApplied =
       Table.TransformColumns(
         Expanded,
@@ -166,117 +207,75 @@ let
       ),
 
   // =========================================================================
-  // BRING IN OPPORTUNITY / ACCOUNT / USER ATTRIBUTES (DENORMALIZED)
-  // No relationships needed — merge directly and keep the columns you want
+  // DENORMALIZE DIMENSIONS (Opportunity / Account / User)
   // =========================================================================
-
-  // ---- Opportunity ----
   OppKeep =
-      let
-        cols = List.Intersect({
-          {"Id","Name","AccountId","OwnerId","StageName","CloseDate"},
-          Table.ColumnNames(SourceOpp)
-        })
-      in
-        Table.TransformColumnTypes(Table.SelectColumns(SourceOpp, cols), {{"Id", type text},{"AccountId", type text},{"OwnerId", type text}}),
-
+      let cols = List.Intersect({
+              {"Id","Name","AccountId","OwnerId","StageName","CloseDate"},
+              Table.ColumnNames(SourceOpp)
+            })
+      in Table.TransformColumnTypes(Table.SelectColumns(SourceOpp, cols), {{"Id", type text},{"AccountId", type text},{"OwnerId", type text}}),
   MergeOpp = Table.NestedJoin(CanonApplied, {"OpportunityId"}, OppKeep, {"Id"}, "Opp", JoinKind.LeftOuter),
-  ExpandOpp =
-      Table.ExpandTableColumn(
-        MergeOpp, "Opp",
-        List.RemoveNulls({"Name","AccountId","OwnerId","StageName","CloseDate"}),
-        List.Transform(List.RemoveNulls({"Name","AccountId","OwnerId","StageName","CloseDate"}), each "Opp_" & _)
-      ),
+  ExpandOpp = Table.ExpandTableColumn(MergeOpp, "Opp",
+               {"Name","AccountId","OwnerId","StageName","CloseDate"},
+               {"Opp_Name","Opp_AccountId","Opp_OwnerId","Opp_StageName","Opp_CloseDate"}),
 
-  // ---- Account (join via Opp_AccountId) ----
-  AcctKeep =
-      let
-        cols = List.Intersect({
-          {"Id","Name"},
-          Table.ColumnNames(SourceAcct)
-        })
-      in
-        Table.TransformColumnTypes(Table.SelectColumns(SourceAcct, cols), {{"Id", type text}}),
-
+  AcctKeep = Table.TransformColumnTypes(Table.SelectColumns(SourceAcct, {"Id","Name"}), {{"Id", type text}}),
   MergeAcct = Table.NestedJoin(ExpandOpp, {"Opp_AccountId"}, AcctKeep, {"Id"}, "Acct", JoinKind.LeftOuter),
-  ExpandAcct =
-      Table.ExpandTableColumn(
-        MergeAcct, "Acct",
-        List.RemoveNulls({"Name"}),
-        List.Transform(List.RemoveNulls({"Name"}), each "Account_" & _)
-      ),
+  ExpandAcct = Table.ExpandTableColumn(MergeAcct, "Acct", {"Name"}, {"Account_Name"}),
 
-  // ---- User (Owner) (join via Opp_OwnerId) ----
-  UserKeep =
-      let
-        cols = List.Intersect({
-          {"Id","Name"},
-          Table.ColumnNames(SourceUser)
-        })
-      in
-        Table.TransformColumnTypes(Table.SelectColumns(SourceUser, cols), {{"Id", type text}}),
-
+  UserKeep = Table.TransformColumnTypes(Table.SelectColumns(SourceUser, {"Id","Name"}), {{"Id", type text}}),
   MergeOwner = Table.NestedJoin(ExpandAcct, {"Opp_OwnerId"}, UserKeep, {"Id"}, "Owner", JoinKind.LeftOuter),
-  ExpandOwner =
-      Table.ExpandTableColumn(
-        MergeOwner, "Owner",
-        List.RemoveNulls({"Name"}),
-        List.Transform(List.RemoveNulls({"Name"}), each "Owner_" & _)
-      ),
+  ExpandOwner = Table.ExpandTableColumn(MergeOwner, "Owner", {"Name"}, {"Owner_Name"}),
 
-  // ---- User (History CreatedBy) (join via Hist_CreatedById) ----
   MergeHistUser = Table.NestedJoin(ExpandOwner, {"Hist_CreatedById"}, UserKeep, {"Id"}, "HistUser", JoinKind.LeftOuter),
-  ExpandHistUser =
-      Table.ExpandTableColumn(
-        MergeHistUser, "HistUser",
-        List.RemoveNulls({"Name"}),
-        List.Transform(List.RemoveNulls({"Name"}), each "HistUser_" & _)
-      ),
+  ExpandHistUser = Table.ExpandTableColumn(MergeHistUser, "HistUser", {"Name"}, {"HistUser_Name"}),
 
   // =========================================================================
-  // FINAL SHAPE & TYPES (denormalized fact — no relationships required)
+  // FINAL SHAPE & TYPES
   // =========================================================================
-  SelectCols =
-      let
-        desired = {
-          "OpportunityId",
-          "FromStage","ToStage","NextStage",
-          "StageStart","StageEnd","DurationDays",
-          // Opportunity snapshot
-          "Opp_Name","Opp_StageName","Opp_CloseDate",
-          // Account
-          "Account_Name",
-          // Owner
-          "Owner_Name",
-          // Who performed the history change
-          "HistUser_Name"
-        },
-        existing = List.Intersect({desired, Table.ColumnNames(ExpandHistUser)})
-      in
-        Table.SelectColumns(ExpandHistUser, existing),
-
-  // Add IsOpenStage flag
   WithIsOpenStage =
       Table.AddColumn(
-        SelectCols,
+        ExpandHistUser,
         "IsOpenStage",
         each [StageEnd] = null,
         type logical
       ),
 
+  AddStageOrder =
+      Table.AddColumn(
+        WithIsOpenStage,
+        "StageOrder",
+        each
+          if [ToStage] = "Intake" then 1
+          else if [ToStage] = "Request Confirmed" then 2
+          else if [ToStage] = "Engagement" then 3
+          else if [ToStage] = "Ready to Assign" then 4
+          else if [ToStage] = "Development" then 5
+          else if [ToStage] = "Testing" then 6
+          else if [ToStage] = "Pending Deployment" then 7
+          else if [ToStage] = "Post Go Live" then 8
+          else if [ToStage] = "Complete" then 9
+          else if [ToStage] = "Blocked" then 98
+          else if [ToStage] = "Removed" then 99
+          else 999,
+        Int64.Type
+      ),
+
   TypedFinal =
       Table.TransformColumnTypes(
-        WithIsOpenStage,
+        AddStageOrder,
         {
           {"OpportunityId", type text},
           {"FromStage", type text}, {"ToStage", type text}, {"NextStage", type text},
           {"StageStart", type datetime}, {"StageEnd", type nullable datetime},
-          {"DurationDays", Int64.Type},
+          {"DurationDays", Int64.Type}, {"BusinessDays", Int64.Type}, {"BusinessHours", type number},
           {"Opp_Name", type text}, {"Opp_StageName", type text}, {"Opp_CloseDate", type nullable date},
           {"Account_Name", type text},
           {"Owner_Name", type text},
           {"HistUser_Name", type text},
-          {"IsOpenStage", type logical}
+          {"IsOpenStage", type logical},
+          {"StageOrder", Int64.Type}
         }
       )
 in
