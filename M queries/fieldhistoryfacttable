@@ -259,9 +259,19 @@ let
         Int64.Type
       ),
 
+  WithDebug =
+    Table.AddColumn(
+        AddStageOrder,
+        "DurationDebug",
+        each Text.From([DurationDays]) & "d / "
+           & Text.From([BusinessDays]) & "bd / "
+           & Text.From([BusinessHours]) & "h",
+        type text
+    ),
+
   TypedFinal =
       Table.TransformColumnTypes(
-        AddStageOrder,
+        WithDebug,
         {
           {"OpportunityId", type text},
           {"FromStage", type text}, {"ToStage", type text}, {"NextStage", type text},
