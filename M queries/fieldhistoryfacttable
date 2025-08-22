@@ -141,7 +141,7 @@ let
       {"testing","Testing"},
       {"pending deployment","Pending Deployment"},
       {"post go live","Post Go Live"},
-      {"post‑go‑live","Post Go Live"},
+      {"post-go-live","Post Go Live"},
       {"complete","Complete"},
       {"closed","Closed"},
       {"blocked","Blocked"},
@@ -255,9 +255,18 @@ let
       in
         Table.SelectColumns(ExpandHistUser, existing),
 
+  // Add IsOpenStage flag
+  WithIsOpenStage =
+      Table.AddColumn(
+        SelectCols,
+        "IsOpenStage",
+        each [StageEnd] = null,
+        type logical
+      ),
+
   TypedFinal =
       Table.TransformColumnTypes(
-        SelectCols,
+        WithIsOpenStage,
         {
           {"OpportunityId", type text},
           {"FromStage", type text}, {"ToStage", type text}, {"NextStage", type text},
@@ -266,7 +275,8 @@ let
           {"Opp_Name", type text}, {"Opp_StageName", type text}, {"Opp_CloseDate", type nullable date},
           {"Account_Name", type text},
           {"Owner_Name", type text},
-          {"HistUser_Name", type text}
+          {"HistUser_Name", type text},
+          {"IsOpenStage", type logical}
         }
       )
 in
