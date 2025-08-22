@@ -1,14 +1,14 @@
 let
     // PARAMETERS
-    StartYear = 2019,
+    StartYear = 2024,
     EndYear   = Date.Year(DateTime.LocalNow()) + 1,
 
-    // DATES
+    // DATE RANGE
     StartDate = #date(StartYear, 1, 1),
     EndDate   = #date(EndYear, 12, 31),
     DateList  = List.Dates(StartDate, Duration.Days(EndDate - StartDate) + 1, #duration(1,0,0,0)),
 
-    // TO TABLE
+    // BASE TABLE
     DateTable = Table.FromList(DateList, Splitter.SplitByNothing(), {"Date"}, null, ExtraValues.Error),
     ChangedType = Table.TransformColumnTypes(DateTable, {{"Date", type date}}),
 
@@ -24,35 +24,37 @@ let
     AddWeekNum     = Table.AddColumn(AddDowName, "Week Number", each Date.WeekOfYear([Date]), Int64.Type),
     AddYearMonth   = Table.AddColumn(AddWeekNum, "Year-Month", each Text.From(Date.Year([Date])) & "-" & Text.PadStart(Text.From(Date.Month([Date])),2,"0"), type text),
 
-    // FISCAL (starts in January = 1; change if needed)
-    FiscalStartMonth = 1,
+    // FISCAL ATTRIBUTES (Fiscal Year starts July=7)
+    FiscalStartMonth = 7,
     AddFiscalYear =
-        Table.AddColumn(
-            AddYearMonth,
-            "Fiscal Year",
+        Table.AddColumn(AddYearMonth, "Fiscal Year",
             each if Date.Month([Date]) >= FiscalStartMonth then Date.Year([Date]) + 1 else Date.Year([Date]),
             Int64.Type
         ),
     AddFiscalQuarter =
-        Table.AddColumn(
-            AddFiscalYear,
-            "Fiscal Quarter",
-            each
-                let
-                    m = Date.Month([Date]),
-                    n = Number.Mod(m - FiscalStartMonth + 12, 12),
-                    q = Number.IntegerDivide(n, 3) + 1
-                in
-                    "FQ" & Number.ToText(q),
+        Table.AddColumn(AddFiscalYear, "Fiscal Quarter",
+            each "FQ" & Number.ToText(
+                Number.IntegerDivide(
+                    Number.Mod(Date.Month([Date]) - FiscalStartMonth + 12, 12), 3
+                ) + 1
+            ),
             type text
         ),
+
+    // =====================================================
+    // HOLIDAY LOOKUP (join to Holidays table by Date)
+    // =====================================================
+    Merged = Table.NestedJoin(AddFiscalQuarter, {"Date"}, Holidays, {"ObservedDate"}, "HolidayJoin", JoinKind.LeftOuter),
+    Expanded = Table.ExpandTableColumn(Merged, "HolidayJoin", {"Name"}, {"HolidayName"}),
+    WithIsHoliday = Table.AddColumn(Expanded, "IsHoliday", each [HolidayName] <> null, type logical),
 
     // FINAL ORDER
     Reordered =
         Table.ReorderColumns(
-            AddFiscalQuarter,
+            WithIsHoliday,
             {"Date","Year","Quarter","Month Number","Month Name","Month Short","Year-Month",
-             "Fiscal Year","Fiscal Quarter","Week Number","Day","Day of Week","Day Name"}
+             "Fiscal Year","Fiscal Quarter","Week Number","Day","Day of Week","Day Name",
+             "IsHoliday","HolidayName"}
         )
 in
     Reordered
