@@ -1,6 +1,6 @@
 let
     // PARAMETERS
-    StartYear = 2024,
+    StartYear = 2019,
     EndYear   = Date.Year(DateTime.LocalNow()) + 1,
 
     // DATE RANGE
@@ -19,12 +19,12 @@ let
     AddMonthName   = Table.AddColumn(AddMonthNum, "Month Name", each Date.MonthName([Date]), type text),
     AddMonthShort  = Table.AddColumn(AddMonthName, "Month Short", each Text.Start(Date.MonthName([Date]),3), type text),
     AddDay         = Table.AddColumn(AddMonthShort, "Day", each Date.Day([Date]), Int64.Type),
-    AddDow         = Table.AddColumn(AddDay, "Day of Week", each Date.DayOfWeek([Date]), Int64.Type),
+    AddDow         = Table.AddColumn(AddDay, "Day of Week", each Date.DayOfWeek([Date], Day.Monday), Int64.Type), // 0=Mon ... 6=Sun
     AddDowName     = Table.AddColumn(AddDow, "Day Name", each Date.DayOfWeekName([Date]), type text),
     AddWeekNum     = Table.AddColumn(AddDowName, "Week Number", each Date.WeekOfYear([Date]), Int64.Type),
     AddYearMonth   = Table.AddColumn(AddWeekNum, "Year-Month", each Text.From(Date.Year([Date])) & "-" & Text.PadStart(Text.From(Date.Month([Date])),2,"0"), type text),
 
-    // FISCAL ATTRIBUTES (Fiscal Year starts July=7)
+    // FISCAL (starts July=7; change if needed)
     FiscalStartMonth = 7,
     AddFiscalYear =
         Table.AddColumn(AddYearMonth, "Fiscal Year",
@@ -41,20 +41,26 @@ let
             type text
         ),
 
-    // =====================================================
-    // HOLIDAY LOOKUP (join to Holidays table by Date)
-    // =====================================================
-    Merged = Table.NestedJoin(AddFiscalQuarter, {"Date"}, Holidays, {"ObservedDate"}, "HolidayJoin", JoinKind.LeftOuter),
-    Expanded = Table.ExpandTableColumn(Merged, "HolidayJoin", {"Name"}, {"HolidayName"}),
+    // HOLIDAY LOOKUP (join to Holidays table by ObservedDate)
+    Merged        = Table.NestedJoin(AddFiscalQuarter, {"Date"}, Holidays, {"ObservedDate"}, "HolidayJoin", JoinKind.LeftOuter),
+    Expanded      = Table.ExpandTableColumn(Merged, "HolidayJoin", {"Name"}, {"HolidayName"}),
     WithIsHoliday = Table.AddColumn(Expanded, "IsHoliday", each [HolidayName] <> null, type logical),
+
+    // BUSINESS DAY FLAG: Mon–Fri (0..4) and not a holiday
+    WithBusiness  = Table.AddColumn(
+                        WithIsHoliday,
+                        "IsBusinessDay",
+                        each ([Day of Week] >= 0 and [Day of Week] <= 4) and (not [IsHoliday]),
+                        type logical
+                    ),
 
     // FINAL ORDER
     Reordered =
         Table.ReorderColumns(
-            WithIsHoliday,
+            WithBusiness,
             {"Date","Year","Quarter","Month Number","Month Name","Month Short","Year-Month",
              "Fiscal Year","Fiscal Quarter","Week Number","Day","Day of Week","Day Name",
-             "IsHoliday","HolidayName"}
+             "IsHoliday","HolidayName","IsBusinessDay"}
         )
 in
     Reordered
