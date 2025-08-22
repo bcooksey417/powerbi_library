@@ -13,11 +13,15 @@ let
   SourceOpp     = #"Opportunity",
   SourceAcct    = #"Account",
   SourceUser    = #"User",
+  SourceHol     = #"Holidays",   // holiday table (must have ObservedDate column)
+
+  // =========================================================================
+  // HOLIDAYS LIST (buffer for performance)
+  // =========================================================================
+  HolidaysList = List.Buffer( List.Transform(SourceHol[ObservedDate], each Date.From(_)) ),
 
   // =========================================================================
   // KEEP NEEDED COLUMNS & FILTER EVENTS
-  // - StageName = all stage transitions
-  // - Created   = Salesforce card creation (we'll map to "Request Confirmed")
   // =========================================================================
   HistKeep =
       Table.SelectColumns(
@@ -29,8 +33,6 @@ let
         HistKeep,
         each Text.Lower([Field]) = "stagename" or Text.Lower([Field]) = "created"
       ),
-
-  // Types
   HistTyped =
       Table.TransformColumnTypes(
         HistFiltered,
@@ -59,12 +61,8 @@ let
         each if Text.Lower([Field]) = "created" then null else [OldValue],
         type text
       ),
-
-  // Keep only events that actually produce a ToStage
   HistMeaningful =
       Table.SelectRows(AddFromStageForCreated, each [ToStageRaw] <> null and Text.Trim([ToStageRaw]) <> ""),
-
-  // Sort for stable sequencing
   HistSorted =
       Table.Sort(HistMeaningful, {{"OpportunityId", Order.Ascending}, {"CreatedDate", Order.Ascending}}),
 
@@ -80,10 +78,8 @@ let
             (t) =>
               let
                 t1 = Table.AddIndexColumn(t, "ix", 0, 1, Int64.Type),
-
                 nextDateList  = List.Skip(t1[CreatedDate], 1) & {null},
                 nextStageList = List.Skip(t1[ToStageRaw],   1) & {null},
-
                 t2 = Table.AddColumn(t1, "StageEndRaw", each nextDateList{[ix]}, type nullable datetime),
                 t3 = Table.AddColumn(t2, "NextStageRaw", each nextStageList{[ix]}, type nullable text),
 
@@ -96,7 +92,7 @@ let
                     )
                   else t3,
 
-                // Duration in calendar days
+                // Calendar days
                 t5 = Table.AddColumn(
                        t4, "DurationDaysRaw",
                        each if [StageEndRaw] = null then null else Duration.Days([StageEndRaw] - [CreatedDate]),
@@ -104,24 +100,25 @@ let
                      ),
 
                 // =========================================================================
-                // BUSINESS DAYS: Mon–Fri only (exclusive of end date)
+                // BUSINESS DAYS: Mon–Fri, excluding holidays
                 // =========================================================================
                 t6 = Table.AddColumn(
                        t5, "BusinessDaysRaw",
                        each if [StageEndRaw] = null then null else
                          let
                            s = Date.From([CreatedDate]),
-                           e = Date.AddDays(Date.From([StageEndRaw]), -1),    // exclusive of StageEnd
+                           e = Date.AddDays(Date.From([StageEndRaw]), -1),    // exclusive end
                            span = if e < s then 0 else Duration.Days(e - s) + 1,
                            dates = if span <= 0 then {} else List.Dates(s, span, #duration(1,0,0,0)),
                            weekdays = List.Select(dates, each Date.DayOfWeek(_, Day.Monday) < 5),
-                           cnt = List.Count(weekdays)
+                           noHols = List.Difference(weekdays, HolidaysList),
+                           cnt = List.Count(noHols)
                          in cnt,
                        Int64.Type
                      ),
 
                 // =========================================================================
-                // BUSINESS HOURS: within WorkingDayStart..WorkingDayEnd, Mon–Fri
+                // BUSINESS HOURS: Mon–Fri, 9–5, excluding holidays
                 // =========================================================================
                 t7 = Table.AddColumn(
                        t6, "BusinessHoursRaw",
@@ -132,8 +129,9 @@ let
                            nDays = Duration.Days(eDate - sDate) + 1,
                            allDays = if nDays <= 0 then {} else List.Dates(sDate, nDays, #duration(1,0,0,0)),
                            weekdays = List.Select(allDays, each Date.DayOfWeek(_, Day.Monday) < 5),
+                           workdays = List.Difference(weekdays, HolidaysList),
                            hoursPerDay = List.Transform(
-                             weekdays,
+                             workdays,
                              (d as date) =>
                                let
                                  ws = #datetime(Date.Year(d), Date.Month(d), Date.Day(d),
@@ -142,7 +140,7 @@ let
                                                 Time.Hour(WorkingDayEnd), Time.Minute(WorkingDayEnd), 0),
                                  ps = if Date.From([CreatedDate]) = d then if [CreatedDate] > ws then [CreatedDate] else ws else ws,
                                  pe = if Date.From([StageEndRaw]) = d then if [StageEndRaw] < we then [StageEndRaw] else we else we,
-                                 hrs = Number.Max(0, Duration.TotalHours(pe - ps))
+                                 hrs = List.Max({0, Duration.TotalHours(pe - ps)})
                                in hrs
                            ),
                            total = List.Sum(hoursPerDay)
@@ -155,7 +153,6 @@ let
           }
         }
       ),
-
   Expanded =
       Table.ExpandTableColumn(
         Grouped, "Rows",
