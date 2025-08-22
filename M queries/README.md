@@ -1,6 +1,6 @@
-M queries
+# M Queries
 
-create date table
+## create date table
 
 📝 Notes
 
