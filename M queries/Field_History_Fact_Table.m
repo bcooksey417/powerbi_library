@@ -93,16 +93,57 @@ let
         ),
 
     // =========================================================================
-    // COMBINE + FILTER EVENTS (Created + StageName, exclude "New")
+    // SYNTHETIC "INTAKE" EVENTS  (from Opportunity[Intake_Form_Received_Date__c])
+    // =========================================================================
+    IntakeKeep =
+        Table.SelectColumns(
+            Opp,
+            {"Id","Intake_Form_Received_Date__c"}
+        ),
+
+    IntakeValid =
+        Table.SelectRows(IntakeKeep, each [Intake_Form_Received_Date__c] <> null),
+
+    IntakeEventsBase =
+        Table.TransformColumns(
+            IntakeValid,
+            {{"Intake_Form_Received_Date__c",
+               each #datetime(Date.Year(_), Date.Month(_), Date.Day(_), Time.Hour(WorkingDayStart), Time.Minute(WorkingDayStart), 0),
+               type datetime}}
+        ),
+
+    IntakeEvents =
+        Table.FromColumns(
+            {
+                IntakeEventsBase[Id],                                              // OpportunityId (will rename)
+                List.Repeat({"Intake_Synthetic"}, Table.RowCount(IntakeEventsBase)), // Field tag
+                List.Repeat({null},             Table.RowCount(IntakeEventsBase)), // OldValue
+                List.Repeat({"Intake"},         Table.RowCount(IntakeEventsBase)), // NewValue (stage label)
+                IntakeEventsBase[Intake_Form_Received_Date__c],                   // CreatedDate (StageTS anchor)
+                List.Repeat({null},             Table.RowCount(IntakeEventsBase))  // CreatedById
+            },
+            type table [
+                OpportunityId = text,
+                Field         = text,
+                OldValue      = nullable text,
+                NewValue      = text,
+                CreatedDate   = datetime,
+                CreatedById   = nullable text
+            ]
+        ),
+
+    // =========================================================================
+    // COMBINE + FILTER EVENTS (Created + StageName, exclude "New", include Intake_Synthetic)
     // =========================================================================
     HistAugmented =
-        Table.Combine({ HistKeep, GoLiveEvents }),
+        Table.Combine({ HistKeep, GoLiveEvents, IntakeEvents }),
 
     HistFilteredForFact =
         Table.SelectRows(
             HistAugmented,
             each let f = Text.Lower([Field]) in
                 (f = "created")
+              or (f = "intake_synthetic")
               or (f = "stagename" and Text.Upper(Text.From([NewValue])) <> "NEW")
         ),
 
@@ -111,9 +152,14 @@ let
     // =========================================================================
     Add_StageTS    = Table.AddColumn(HistFilteredForFact, "StageTS", each [CreatedDate], type datetime),
     Add_ToStageRaw = Table.AddColumn(Add_StageTS, "ToStageRaw",
-                        each if Text.Lower([Field]) = "created" then "New" else [NewValue], type text),
+                        each if Text.Lower([Field]) = "created" then "New"
+                             else if Text.Lower([Field]) = "intake_synthetic" then "Intake"
+                             else [NewValue],
+                        type text),
     Add_FromStageRaw = Table.AddColumn(Add_ToStageRaw, "FromStageRaw",
-                        each if Text.Lower([Field]) = "created" then null else [OldValue], type text),
+                        each if Text.Lower([Field]) = "created" or Text.Lower([Field]) = "intake_synthetic"
+                             then null else [OldValue],
+                        type text),
 
     SortEvents = Table.Sort(Add_FromStageRaw, {{"OpportunityId", Order.Ascending}, {"StageTS", Order.Ascending}}),
     GroupByOpp =
@@ -142,16 +188,13 @@ let
     // Explicit type conversion
     // =========================================================================
     ChangeTypes =
-    Table.TransformColumnTypes(
-        ExpandRows,
-        {
-            {"StageStart", type datetime},
-            {"StageEnd",   type datetime},
-            {"CreatedDate", type datetime}
-        }
-    ),
-
-
+        Table.TransformColumnTypes(
+            ExpandRows,
+            {
+                {"StageStart", type datetime},
+                {"StageEnd",   type datetime}
+            }
+        ),
 
     // =========================================================================
     // CANONICALIZE KEYS (trim+lowercase) for join, preserve original labels
@@ -300,8 +343,8 @@ let
             }
         ),
 
-    // (Optional) spot-check Actual Go Live
-    // #"Filtered Rows" = Table.SelectRows(Final, each [ToStage] = "Actual Go Live")
+    // (Optional) spot-check Intake
+    // #"Filtered Rows" = Table.SelectRows(Final, each [ToStage] = "Intake")
     Output = Final
 in
     Output
