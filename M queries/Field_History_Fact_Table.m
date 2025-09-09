@@ -45,52 +45,133 @@ let
             {"OpportunityId","Field","OldValue","NewValue","CreatedDate","CreatedById"}
         ),
 
-    // =========================================================================
-    // SYNTHETIC "ACTUAL GO LIVE" EVENTS
-    // =========================================================================
-    GoLiveHistOnly =
-        Table.SelectRows(HistBase, each Text.Lower([Field]) = "actual_deployment_go_live_date__c"),
+   // =========================================================================
+// SYNTHETIC "ACTUAL GO LIVE" EVENTS  (history-first, with provenance flag)
+// =========================================================================
+GoLiveHistOnly =
+    Table.SelectRows(HistBase, each Text.Lower([Field]) = "actual_deployment_go_live_date__c"),
 
-    GoLiveParsed =
-        Table.TransformColumns(
-            GoLiveHistOnly,
-            {{"NewValue", each try Date.From(_) otherwise null, type nullable date}}
-        ),
+GoLiveParsed =
+    Table.TransformColumns(
+        GoLiveHistOnly,
+        {{"NewValue", each try Date.From(_) otherwise null, type nullable date}}
+    ),
 
-    GoLiveValid =
-        Table.SelectRows(GoLiveParsed, each [NewValue] <> null),
+GoLiveValid =
+    Table.SelectRows(GoLiveParsed, each [NewValue] <> null),
 
-    GoLiveLatestPerOpp =
-        Table.Group(
-            GoLiveValid, {"OpportunityId"},
-            { {"GoLiveDate", each List.Last([NewValue]), type date} }
-        ),
+GoLiveLatestPerOpp =
+    Table.Group(
+        GoLiveValid, {"OpportunityId"},
+        { {"GoLiveDate", each List.Last([NewValue]), type date} }
+    ),
 
-    GoLiveEventsBase =
-        Table.TransformColumns(
-            GoLiveLatestPerOpp,
-            {{"GoLiveDate", each #datetime(Date.Year(_), Date.Month(_), Date.Day(_), 9, 0, 0), type datetime}}
-        ),
+GoLiveEventsBase =
+    Table.TransformColumns(
+        GoLiveLatestPerOpp,
+        {{"GoLiveDate", each #datetime(Date.Year(_), Date.Month(_), Date.Day(_), 9, 0, 0), type datetime}}
+    ),
 
-    GoLiveEvents =
-        Table.FromColumns(
-            {
-                GoLiveEventsBase[OpportunityId],
-                List.Repeat({"StageName"}, Table.RowCount(GoLiveEventsBase)),      // Field
-                List.Repeat({null},         Table.RowCount(GoLiveEventsBase)),     // OldValue
-                List.Repeat({"Actual Go Live"}, Table.RowCount(GoLiveEventsBase)), // NewValue
-                GoLiveEventsBase[GoLiveDate],                                      // CreatedDate
-                List.Repeat({null},         Table.RowCount(GoLiveEventsBase))      // CreatedById
-            },
-            type table [
-                OpportunityId = text,
-                Field         = text,
-                OldValue      = nullable text,
-                NewValue      = text,
-                CreatedDate   = datetime,
-                CreatedById   = nullable text
-            ]
-        ),
+GoLiveEventsRaw =
+    Table.FromColumns(
+        {
+            GoLiveEventsBase[OpportunityId],
+            List.Repeat({"StageName"}, Table.RowCount(GoLiveEventsBase)),      // Field
+            List.Repeat({null},         Table.RowCount(GoLiveEventsBase)),     // OldValue
+            List.Repeat({"Actual Go Live"}, Table.RowCount(GoLiveEventsBase)), // NewValue
+            GoLiveEventsBase[GoLiveDate],                                      // CreatedDate
+            List.Repeat({null},         Table.RowCount(GoLiveEventsBase))      // CreatedById
+        },
+        type table [
+            OpportunityId = text,
+            Field         = text,
+            OldValue      = nullable text,
+            NewValue      = text,
+            CreatedDate   = datetime,
+            CreatedById   = nullable text
+        ]
+    ),
+
+// Add provenance = History
+GoLiveEvents = Table.AddColumn(GoLiveEventsRaw, "Source", each "History", type text),
+
+// =========================================================================
+// BACKFILL FROM OPPORTUNITY when no history-derived go-live exists
+//   (provenance = OppBackFill)
+// =========================================================================
+
+// Optional: limit backfill to a year range by uncommenting:
+// YearStart = 2024,
+// YearEnd   = 2024,
+
+OppGoLive_Current0 =
+    Table.SelectColumns(Opp, {"Id","Actual_Deployment_Go_Live_Date__c"}),
+
+OppGoLive_Typed =
+    Table.TransformColumnTypes(
+        OppGoLive_Current0,
+        {{"Actual_Deployment_Go_Live_Date__c", type date}}
+    ),
+
+OppGoLive_Valid =
+    Table.SelectRows(
+        OppGoLive_Typed,
+        each [Actual_Deployment_Go_Live_Date__c] <> null
+            // and Date.Year([Actual_Deployment_Go_Live_Date__c]) >= YearStart
+            // and Date.Year([Actual_Deployment_Go_Live_Date__c]) <= YearEnd
+    ),
+
+OppGoLive_EventsBase =
+    Table.TransformColumns(
+        OppGoLive_Valid,
+        {{"Actual_Deployment_Go_Live_Date__c",
+            each #datetime(Date.Year(_), Date.Month(_), Date.Day(_), 9, 0, 0),
+            type datetime}}
+    ),
+
+OppGoLive_EventsRaw =
+    Table.FromColumns(
+        {
+            OppGoLive_EventsBase[Id],                                        // OpportunityId
+            List.Repeat({"StageName"}, Table.RowCount(OppGoLive_EventsBase)),
+            List.Repeat({null},        Table.RowCount(OppGoLive_EventsBase)),
+            List.Repeat({"Actual Go Live"}, Table.RowCount(OppGoLive_EventsBase)),
+            OppGoLive_EventsBase[Actual_Deployment_Go_Live_Date__c],         // CreatedDate (09:00)
+            List.Repeat({null},        Table.RowCount(OppGoLive_EventsBase))
+        },
+        type table [
+            OpportunityId = text,
+            Field         = text,
+            OldValue      = nullable text,
+            NewValue      = text,
+            CreatedDate   = datetime,
+            CreatedById   = nullable text
+        ]
+    ),
+
+// Add provenance = OppBackFill
+OppGoLive_Events = Table.AddColumn(OppGoLive_EventsRaw, "Source", each "OppBackFill", type text),
+
+// =========================================================================
+// ANTI-FILTER (no duplicate column names, fast with buffered list)
+// =========================================================================
+
+// Distinct OppIds that already have a history-derived go-live
+HistGoLiveIdsTbl = Table.Distinct( Table.SelectColumns(GoLiveEvents, {"OpportunityId"}) ),
+HistGoLiveIdList = List.Buffer( HistGoLiveIdsTbl[OpportunityId] ),
+
+// Keep only Opp backfill rows whose OpportunityId is NOT in the history list
+OppGoLive_NoHist =
+    Table.SelectRows(
+        OppGoLive_Events,
+        each not List.Contains(HistGoLiveIdList, [OpportunityId])
+    ),
+
+// Final union: history-first + backfill
+GoLiveEvents_Union =
+    Table.Combine({ GoLiveEvents, OppGoLive_NoHist }),
+
+
 
     // =========================================================================
     // SYNTHETIC "INTAKE" EVENTS  (from Opportunity[Intake_Form_Received_Date__c])
@@ -136,7 +217,7 @@ let
     // COMBINE + FILTER EVENTS (Created + StageName, exclude "New", include Intake_Synthetic)
     // =========================================================================
     HistAugmented =
-        Table.Combine({ HistKeep, GoLiveEvents, IntakeEvents }),
+        Table.Combine({ HistKeep, GoLiveEvents_Union, IntakeEvents }),
 
     HistFilteredForFact =
         Table.SelectRows(
@@ -169,7 +250,8 @@ let
               { "Rows",
                 (t) =>
                   let
-                    t1 = Table.AddIndexColumn(t, "ix", 0, 1, Int64.Type),
+                    gSorted = Table.Sort(t, {{"StageTS", Order.Ascending}}),
+                    t1 = Table.AddIndexColumn(gSorted, "ix", 0, 1, Int64.Type),
                     nextTS = List.Skip(t1[StageTS], 1) & {null},
                     t2 = Table.AddColumn(t1, "StageEnd", each nextTS{[ix]}, type nullable datetime)
                   in t2,
@@ -314,7 +396,7 @@ let
     // =========================================================================
     OppKeep =
         let cols = List.Intersect({
-                {"Id","Name","AccountId","OwnerId","StageName","IsRunMaintain"},
+                {"Id","Name","AccountId","OwnerId","StageName","IsRunMaintain","Project_Type__c"},
                  Table.ColumnNames(Opp)
         })
         in Table.SelectColumns(Opp, cols),
@@ -323,8 +405,8 @@ let
     ExpandOpp =
         Table.ExpandTableColumn(
             JoinOpp, "Opp",
-            {"Name","AccountId","OwnerId","StageName","IsRunMaintain"},
-            {"Opp_Name","Opp_AccountId","Opp_OwnerId","Opp_StageName","IsRunMaintain"}
+            {"Name","AccountId","OwnerId","StageName","IsRunMaintain","Project_Type__c"},
+            {"Opp_Name","Opp_AccountId","Opp_OwnerId","Opp_StageName","IsRunMaintain","Opp_Type"}
         ),
 
     // =========================================================================
@@ -334,7 +416,7 @@ let
         Table.SelectColumns(
             ExpandOpp,
             {
-              "OpportunityId","Opp_Name","Opp_AccountId","Opp_OwnerId","IsRunMaintain",
+              "OpportunityId","Opp_Name","Opp_AccountId","Opp_OwnerId","IsRunMaintain", "Opp_Type",
               "FromStage","ToStage","StageOrder",
               "StageStart","StageEnd",
               "DurationDays","BusinessDays","BusinessHours",
@@ -345,6 +427,14 @@ let
 
     // (Optional) spot-check Intake
     // #"Filtered Rows" = Table.SelectRows(Final, each [ToStage] = "Intake")
-    Output = Final
+    
+    // =========================================================================
+    // ADD StageKey (numeric copy of StageOrder for relationship to DimStage)
+    // =========================================================================
+    Fact_WithStageKey =
+        Table.AddColumn(Final, "StageKey", each [StageOrder], Int64.Type),
+
+    // Output this as the fact table
+    Output = Fact_WithStageKey
 in
     Output
